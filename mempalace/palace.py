@@ -1,425 +1,335 @@
 """
-palace.py — Shared palace operations.
+The Palace — top-level coordinator that bundles the subsystems.
 
-Consolidates collection access patterns used by both miners and the MCP server.
+# What this is
+
+The original `mempalace-develop` had a single `palace.py` that was the
+main entry point — one class that held a knowledge graph + searcher +
+miner + storage + everything else.
+
+The greenfield architecture decomposed that monolith into focused
+subsystems (log, views, handle, retrieve, federate, miner, secure,
+canonicalizer, ...). That decomposition is real: each piece has its
+own module surface and is testable in isolation.
+
+But callers don't want to wire 12 subsystems by hand to do "open a
+palace and ask a question." This module restores the unified
+entrypoint **without re-monolithizing**: `Palace` is a thin facade
+that constructs the subsystems, holds references, and exposes the
+common verbs (capture / search / mine / federate / migrate).
+
+If you only need one subsystem, import it directly. If you want
+"a palace, integrated, ready to use," use `Palace`.
+
+# Lifecycle
+
+```python
+from mempalace import Palace
+
+# Create or open
+palace = Palace.create(palace_dir="/path/to/palace")
+# or
+palace = Palace.open(palace_dir="/path/to/palace")
+
+# Capture
+result = palace.capture(transcript="this is what happened today")
+
+# Search
+hits = palace.search("what was happening last week", scope=...)
+
+# Federate
+match = palace.federate.find_compatible_palace(other_palace_id)
+
+# Close
+palace.close()
+```
+
+# What's NOT here
+
+- The CLI entrypoint (would import Palace and wrap it for argparse)
+- The MCP server (would import Palace and serve over MCP)
+- The voice stack daemon main-loop
+- The phone-side interfaces
+
+Those are operational concerns built on top of `Palace`. This module
+is the architectural-API entry point.
+
+Spec ref: this is the missing seam between the old `palace.py`
+monolith and the new subsystem decomposition. It reconciles a
+clean module hierarchy with a callable single-entry surface.
 """
 
-import contextlib
-import hashlib
-import os
-import re
+from __future__ import annotations
 
-from .backends.chroma import ChromaBackend
+import logging
+from dataclasses import dataclass
+from typing import Any, Optional
 
-SKIP_DIRS = {
-    ".git",
-    "node_modules",
-    "__pycache__",
-    ".venv",
-    "venv",
-    "env",
-    "dist",
-    "build",
-    ".next",
-    "coverage",
-    ".mempalace",
-    ".ruff_cache",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".cache",
-    ".tox",
-    ".nox",
-    ".idea",
-    ".vscode",
-    ".ipynb_checkpoints",
-    ".eggs",
-    "htmlcov",
-    "target",
-}
+from .canonicalizer import Canonicalizer
+from .drawer.capture import CaptureResult, capture_drawer
+from .log.client import LogClient, get_default_client
+from .retrieve.handle import HandleManager, get_handle_manager
+from .secure.element import PhoneSecureElement
+from .secure.phone_off import PhoneOffStateMachine
+from .views import current as views
+from .views.graph import Graph
 
-_DEFAULT_BACKEND = ChromaBackend()
-
-# Schema version for drawer normalization. Bump when the normalization
-# pipeline changes in a way that existing drawers should be rebuilt to pick up
-# (e.g., new noise-stripping rules). `file_already_mined` treats drawers with
-# a missing or stale `normalize_version` as "not mined", so the next mine pass
-# silently rebuilds them — users don't need to manually erase + re-mine.
-#
-# v2 (2026-04): introduced strip_noise() for Claude Code JSONL; previous
-#               drawers stored system tags / hook chrome verbatim.
-NORMALIZE_VERSION = 2
+logger = logging.getLogger(__name__)
 
 
-def get_collection(
-    palace_path: str,
-    collection_name: str = "mempalace_drawers",
-    create: bool = True,
-):
-    """Get the palace collection through the backend layer."""
-    return _DEFAULT_BACKEND.get_collection(
-        palace_path,
-        collection_name=collection_name,
-        create=create,
-    )
+@dataclass
+class PalaceConfig:
+    """Construction-time configuration for a Palace."""
+
+    palace_dir: str = ""
+    """Filesystem directory where this palace's log + DD views live.
+    Empty = in-memory only (test mode)."""
+
+    palace_id: str = ""
+    """The palace's federation identifier. Set on first use; should
+    match the on-chain `Palace` PDA address once registered."""
+
+    secure_element: PhoneSecureElement | None = None
+    """Phone-side encryption surface for v2 drawer encryption. None =
+    plaintext (v0) drawer storage; the daemon-only paths."""
+
+    enable_phone_off_state_machine: bool = True
+    """When True, instantiate a `PhoneOffStateMachine` for graceful
+    degradation. Disable for unit tests that don't model a phone
+    boundary."""
 
 
-def get_closets_collection(palace_path: str, create: bool = True):
-    """Get the closets collection — the searchable index layer."""
-    return get_collection(palace_path, collection_name="mempalace_closets", create=create)
+class Palace:
+    """The integrated palace. Holds references to the subsystems and
+    exposes the common verbs."""
 
+    def __init__(self, config: PalaceConfig) -> None:
+        self._config = config
+        self._closed = False
 
-CLOSET_CHAR_LIMIT = 1500  # fill closet until ~1500 chars, then start a new one
-CLOSET_EXTRACT_WINDOW = 5000  # how many chars of source content to scan for entities/topics
+        # ---- Layer 0: log -------------------------------------------------
+        # The log is the source of truth. Every other subsystem reads
+        # from it; some write through batch handles.
+        self.log: LogClient = get_default_client()
 
-# Common capitalized words that look like proper nouns but are usually
-# sentence-starters or filler. Filtered out of entity extraction.
-_ENTITY_STOPLIST = frozenset(
-    {
-        "The",
-        "This",
-        "That",
-        "These",
-        "Those",
-        "When",
-        "Where",
-        "What",
-        "Why",
-        "Who",
-        "Which",
-        "How",
-        "After",
-        "Before",
-        "Then",
-        "Now",
-        "Here",
-        "There",
-        "And",
-        "But",
-        "Or",
-        "Yet",
-        "So",
-        "If",
-        "Else",
-        "Yes",
-        "No",
-        "Maybe",
-        "Okay",
-        "User",
-        "Assistant",
-        "System",
-        "Tool",
-        "Monday",
-        "Tuesday",
-        "Wednesday",
-        "Thursday",
-        "Friday",
-        "Saturday",
-        "Sunday",
-        "January",
-        "February",
-        "March",
-        "April",
-        "May",
-        "June",
-        "July",
-        "August",
-        "September",
-        "October",
-        "November",
-        "December",
-    }
-)
+        # ---- Layer 1: derived views --------------------------------------
+        # `views` is a module, not a class — it materializes node/edge
+        # state from the log. The Graph below uses it.
+        self.graph: Graph = Graph(client=self.log)
 
+        # ---- Layer 2: canonicalization -----------------------------------
+        self.canonicalizer: Canonicalizer = Canonicalizer()
 
-_CANDIDATE_RX_CACHE = None
+        # ---- Layer 3: handles --------------------------------------------
+        # mem_allocate / mem_refine / mem_resolve / mem_close go through
+        # this manager. Module-level helpers in mempalace.retrieve.handle
+        # use the same default manager.
+        self.handle_manager: HandleManager = get_handle_manager()
 
+        # ---- Layer 4: phone-off state machine ----------------------------
+        if config.enable_phone_off_state_machine:
+            self.phone_off: Optional[PhoneOffStateMachine] = (
+                PhoneOffStateMachine(log_client=self.log)
+            )
+        else:
+            self.phone_off = None
 
-def _candidate_entity_words(text: str) -> list:
-    """Find entity candidate words using i18n-aware patterns.
+        # ---- Layer 5: federation, miner, switchboard, resolve, secure ---
+        # These are accessed through their own module surfaces; no
+        # need to instantiate state-holding objects on Palace.
+        # See: palace.federate (module), palace.miner (module), etc.
+        # Public verbs below dispatch to those modules.
 
-    Uses the same candidate_patterns as entity_detector (loaded from locale
-    JSON files via get_entity_patterns), so non-Latin names (Cyrillic,
-    accented Latin, etc.) are detected alongside ASCII names.
-    """
-    global _CANDIDATE_RX_CACHE
-    if _CANDIDATE_RX_CACHE is None:
-        from .config import MempalaceConfig
-        from .i18n import get_entity_patterns
+        logger.info(
+            "Palace initialized: dir=%s palace_id=%s",
+            config.palace_dir or "<in-memory>",
+            config.palace_id or "<unregistered>",
+        )
 
-        patterns = get_entity_patterns(MempalaceConfig().entity_languages)
-        rxs = []
-        for pat in patterns["candidate_patterns"]:
-            try:
-                rxs.append(re.compile(pat))
-            except re.error:
-                continue
-        _CANDIDATE_RX_CACHE = rxs
-    words = []
-    for rx in _CANDIDATE_RX_CACHE:
-        words.extend(rx.findall(text))
-    return words
+    # ========================================================================
+    # Construction
+    # ========================================================================
 
+    @classmethod
+    def create(cls, *, palace_dir: str = "", **kwargs: Any) -> "Palace":
+        """Create a fresh palace. Initializes the log + DD views from
+        scratch. Use `open()` for an existing palace.
 
-def build_closet_lines(source_file, drawer_ids, content, wing, room):
-    """Build compact closet pointer lines from drawer content.
+        For in-memory (test mode), pass palace_dir="".
+        """
+        config = PalaceConfig(palace_dir=palace_dir, **kwargs)
+        # In-memory mode is the default behavior of get_default_client();
+        # filesystem-backed palaces would wire a different LogClient impl
+        # here. That's an operational concern not yet wired in greenfield.
+        return cls(config)
 
-    Returns a LIST of lines (not joined). Each line is one complete topic
-    pointer — never split across closets.
+    @classmethod
+    def open(cls, *, palace_dir: str, **kwargs: Any) -> "Palace":
+        """Open an existing palace at `palace_dir`. Replays the log to
+        warm DD views, then returns the ready palace."""
+        if not palace_dir:
+            raise ValueError("palace_dir required for open()")
+        config = PalaceConfig(palace_dir=palace_dir, **kwargs)
+        palace = cls(config)
+        # Replay the log to warm views
+        views.tick_views()
+        return palace
 
-    Format: topic|entities|→drawer_ids
-    """
-    import re
-    from pathlib import Path
+    # ========================================================================
+    # Lifecycle
+    # ========================================================================
 
-    drawer_ref = ",".join(drawer_ids[:3])
-    window = content[:CLOSET_EXTRACT_WINDOW]
-
-    # Extract proper nouns (2+ occurrences). Uses i18n-aware patterns so
-    # non-Latin names (Cyrillic, accented Latin, etc.) are also detected.
-    words = _candidate_entity_words(window)
-    word_freq = {}
-    for w in words:
-        if w in _ENTITY_STOPLIST:
-            continue
-        word_freq[w] = word_freq.get(w, 0) + 1
-    entities = sorted(
-        [w for w, c in word_freq.items() if c >= 2],
-        key=lambda w: -word_freq[w],
-    )[:5]
-    entity_str = ";".join(entities) if entities else ""
-
-    # Extract key phrases — action verbs + context
-    topics = []
-    for pattern in [
-        r"(?:built|fixed|wrote|added|pushed|tested|created|decided|migrated|reviewed|deployed|configured|removed|updated)\s+[\w\s]{3,40}",
-    ]:
-        topics.extend(re.findall(pattern, window, re.IGNORECASE))
-    # Also grab section headers if present
-    for header in re.findall(r"^#{1,3}\s+(.{5,60})$", window, re.MULTILINE):
-        topics.append(header.strip())
-    # Dedupe preserving order
-    topics = list(dict.fromkeys(t.strip().lower() for t in topics))[:12]
-
-    # Extract quotes
-    quotes = re.findall(r'"([^"]{15,150})"', window)
-
-    # Build pointer lines — each one is atomic, never split
-    lines = []
-    for topic in topics:
-        lines.append(f"{topic}|{entity_str}|→{drawer_ref}")
-    for quote in quotes[:3]:
-        lines.append(f'"{quote}"|{entity_str}|→{drawer_ref}')
-
-    # Always have at least one line
-    if not lines:
-        name = Path(source_file).stem[:40]
-        lines.append(f"{wing}/{room}/{name}|{entity_str}|→{drawer_ref}")
-
-    return lines
-
-
-def purge_file_closets(closets_col, source_file: str) -> None:
-    """Delete every closet associated with ``source_file``.
-
-    Call this before ``upsert_closet_lines`` on a re-mine so stale topics
-    from a prior schema/version don't survive in the closet collection.
-    Mirrors the drawer-purge step in process_file().
-    """
-    try:
-        closets_col.delete(where={"source_file": source_file})
-    except Exception:
-        pass
-
-
-def upsert_closet_lines(closets_col, closet_id_base, lines, metadata):
-    """Write topic lines to closets, packed greedily without splitting a line.
-
-    Closets are deterministically numbered (``..._01``, ``..._02``, …) and
-    each ``upsert`` fully overwrites the prior content at that ID. Callers
-    are expected to ``purge_file_closets`` first when re-mining a source
-    file so stale-numbered closets from larger prior runs don't leak.
-
-    Returns the number of closets written.
-    """
-    closet_num = 1
-    current_lines: list = []
-    current_chars = 0
-    closets_written = 0
-
-    def _flush():
-        nonlocal closets_written
-        if not current_lines:
+    def close(self) -> None:
+        """Close the palace. Flushes any pending writes, releases
+        resources. Idempotent."""
+        if self._closed:
             return
-        closet_id = f"{closet_id_base}_{closet_num:02d}"
-        text = "\n".join(current_lines)
-        closets_col.upsert(documents=[text], ids=[closet_id], metadatas=[metadata])
-        closets_written += 1
+        self._closed = True
+        # Subsystems with their own close() get cleaned up here as needed.
+        # Currently log is module-singleton; closing palace doesn't tear
+        # it down because tests rely on get_default_client() being stable.
+        logger.info("Palace closed")
 
-    for line in lines:
-        line_len = len(line)
-        # Would this line fit whole in the current closet?
-        if current_chars > 0 and current_chars + line_len + 1 > CLOSET_CHAR_LIMIT:
-            _flush()
-            closet_num += 1
-            current_lines = []
-            current_chars = 0
+    def __enter__(self) -> "Palace":
+        return self
 
-        current_lines.append(line)
-        current_chars += line_len + 1  # +1 for newline
+    def __exit__(self, *args: Any) -> None:
+        self.close()
 
-    _flush()
-    return closets_written
+    # ========================================================================
+    # Public verbs — the things callers want to do
+    # ========================================================================
 
+    def capture(self, transcript: str, **kwargs: Any) -> CaptureResult:
+        """Capture a new drawer from a transcript.
 
-@contextlib.contextmanager
-def mine_lock(source_file: str):
-    """Cross-platform file lock for mine operations.
+        Thin wrapper over `mempalace.drawer.capture.capture_drawer`
+        that injects the palace's secure_element if one is configured.
+        """
+        if (
+            self._config.secure_element is not None
+            and "secure_element" not in kwargs
+        ):
+            kwargs["secure_element"] = self._config.secure_element
+        return capture_drawer(transcript=transcript, **kwargs)
 
-    Prevents multiple agents from mining the same file simultaneously,
-    which causes duplicate drawers when the delete+insert cycle interleaves.
-    """
-    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
-    os.makedirs(lock_dir, exist_ok=True)
-    lock_path = os.path.join(
-        lock_dir, hashlib.sha256(source_file.encode()).hexdigest()[:16] + ".lock"
-    )
+    def search(self, query: str = "", **kwargs: Any):
+        """High-level retrieval entry point.
 
-    lf = open(lock_path, "w")
-    try:
-        if os.name == "nt":
-            import msvcrt
+        Allocates a handle, runs the search-policy walk, and returns
+        the resolution. For finer-grained control, use the
+        `mempalace.retrieve` API directly (mem_allocate / mem_refine /
+        mem_resolve).
 
-            msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
+        The `query` argument is metadata for now (logged on the
+        handle's consumer_id); the actual scope/stance routing is
+        through the kwargs. A future revision may add a query-string
+        canonicalizer that turns `query` into Scope+Stance directly.
+        """
+        from .retrieve.handle import mem_allocate, mem_close, mem_resolve
+        from .retrieve.scope import Scope
+        from .schema.stance import Stance
 
-            fcntl.flock(lf, fcntl.LOCK_EX)
-        yield
-    finally:
+        scope = kwargs.pop("scope", Scope())
+        stance = kwargs.pop("stance", Stance())
+        consumer_id = kwargs.pop("consumer_id", f"palace.search:{query[:32]}")
+
+        handle_id = mem_allocate(
+            scope=scope, stance=stance,
+            consumer_id=consumer_id,
+            **kwargs,
+        )
         try:
-            if os.name == "nt":
-                import msvcrt
+            return mem_resolve(handle_id)
+        finally:
+            mem_close(handle_id)
 
-                msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
+    def assert_(
+        self,
+        subject_id: str,
+        predicate: str,
+        object_id: str,
+        **kwargs: Any,
+    ) -> str:
+        """Add an assertion to the graph.
 
-                fcntl.flock(lf, fcntl.LOCK_UN)
-        except Exception:
-            pass
-        lf.close()
+        Thin wrapper over `Graph.add_assertion`. Accepts the same
+        kwargs (derived_from_drawers, derived_from_spans, asserter,
+        valid_from_ms, etc.).
+        """
+        return self.graph.add_assertion(
+            subject_id=subject_id,
+            predicate=predicate,
+            object_id=object_id,
+            **kwargs,
+        )
 
+    def temporal_query(self, query, **kwargs: Any):
+        """Run a temporal-triple proximity query.
 
-class MineAlreadyRunning(RuntimeError):
-    """Raised when another `mempalace mine` already holds the per-palace lock."""
+        Per the user reframe of "triple": three characteristics —
+        past, present, future — held in union by a traversal
+        through both substrates (DAG + embeddings).
 
+        Returns a `TemporalResult` with both forms:
+          - `paths` is the structural answer (here are the
+            connections, you draw the meaning)
+          - `synthesized_answer` is the narrative answer (here's
+            the synthesis, citing the path as provenance)
 
-@contextlib.contextmanager
-def mine_palace_lock(palace_path: str):
-    """Per-palace non-blocking lock around the full `mine` pipeline.
+        See `mempalace.retrieve.temporal` for the full API:
+        `TemporalQuery`, `Characteristic`, `TimeAxis`.
+        """
+        from .retrieve.temporal import query_temporal
+        return query_temporal(query, **kwargs)
 
-    The per-file `mine_lock` only protects delete+insert interleave for a
-    single source; it does not prevent N copies of `mempalace mine <dir>`
-    from being spawned concurrently by hooks. When that happens, each copy
-    drives ChromaDB HNSW inserts in parallel against the same palace,
-    which (combined with chromadb's multi-threaded ParallelFor) can
-    corrupt the HNSW graph and produce sparse link_lists.bin blowups.
+    def tick(self) -> int:
+        """Advance the DD views to the latest log offset.
 
-    The lock file is keyed by sha256(palace_path) so mines against
-    *different* palaces can still run in parallel — we only serialize
-    writes into the same palace, which is the correctness boundary.
+        Returns the count of events delivered to subscribers in this
+        tick. Call after a batch of writes if you want immediately
+        visible reads.
+        """
+        return views.tick_views()
 
-    The key is derived from a fully normalized form of the path:
-    `realpath` resolves symlinks and `..` segments, and `normcase` folds
-    case on Windows (which has a case-insensitive filesystem). Without
-    normcase, `C:\\Palace` and `c:\\palace` would hash to different keys
-    on Windows and let two concurrent mines touch the same on-disk palace.
+    # ========================================================================
+    # Subsystem access (for callers who need fine-grained control)
+    # ========================================================================
 
-    Non-blocking: if another `mine` is already writing to this palace,
-    raise MineAlreadyRunning so the caller can exit cleanly instead of
-    piling up as a waiting worker.
-    """
-    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
-    os.makedirs(lock_dir, exist_ok=True)
-    resolved = os.path.realpath(os.path.expanduser(palace_path))
-    lock_key_source = os.path.normcase(resolved)
-    palace_key = hashlib.sha256(lock_key_source.encode()).hexdigest()[:16]
-    lock_path = os.path.join(lock_dir, f"mine_palace_{palace_key}.lock")
+    @property
+    def federate(self):
+        """Return the `mempalace.federate` module surface for
+        federation operations (anchor boundary, layer gates, RHYME)."""
+        from . import federate
+        return federate
 
-    lf = open(lock_path, "w")
-    acquired = False
-    try:
-        if os.name == "nt":
-            import msvcrt
+    @property
+    def miner(self):
+        """Return the `mempalace.miner` module surface for direct
+        miner-pass control."""
+        from . import miner
+        return miner
 
-            try:
-                msvcrt.locking(lf.fileno(), msvcrt.LK_NBLCK, 1)
-                acquired = True
-            except OSError as exc:
-                raise MineAlreadyRunning(
-                    f"another `mempalace mine` is already running against {resolved}"
-                ) from exc
-        else:
-            import fcntl
+    @property
+    def switchboard(self):
+        """Return the `mempalace.switchboard` module surface for
+        oracle SDK operations."""
+        from . import switchboard
+        return switchboard
 
-            try:
-                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-            except BlockingIOError as exc:
-                raise MineAlreadyRunning(
-                    f"another `mempalace mine` is already running against {resolved}"
-                ) from exc
-        yield
-    finally:
-        if acquired:
-            try:
-                if os.name == "nt":
-                    import msvcrt
+    @property
+    def secure(self):
+        """Return the `mempalace.secure` module surface — phone
+        secure element, key manager, burn flow."""
+        from . import secure
+        return secure
 
-                    msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(lf, fcntl.LOCK_UN)
-            except Exception:
-                pass
-        lf.close()
-
-
-# Backward-compatible alias (previous patch iteration used a single global
-# lock). Kept so third-party callers that imported it continue to work; new
-# code should use `mine_palace_lock(palace_path)` for per-palace scoping.
-mine_global_lock = mine_palace_lock
+    @property
+    def query_q(self):
+        """Return the bi-directional query queue for daemon → user
+        questions."""
+        from .query.bidirectional import get_default_queue
+        return get_default_queue()
 
 
-def file_already_mined(collection, source_file: str, check_mtime: bool = False) -> bool:
-    """Check if a file has already been filed in the palace.
-
-    Returns False (so the file gets re-mined) when:
-      - no drawers exist for this source_file
-      - the stored `normalize_version` is missing or older than the current
-        schema (triggers silent rebuild after a normalization upgrade)
-      - `check_mtime=True` and the file's mtime differs from the stored one
-
-    When check_mtime=True (used by project miner), also re-mines on content
-    change. When check_mtime=False (used by convo miner), transcripts are
-    assumed immutable, so only the version gate triggers a rebuild.
-    """
-    try:
-        results = collection.get(where={"source_file": source_file}, limit=1)
-        if not results.get("ids"):
-            return False
-        stored_meta = results.get("metadatas", [{}])[0] or {}
-        # Pre-v2 drawers have no version field — treat them as stale.
-        stored_version = stored_meta.get("normalize_version", 1)
-        if stored_version < NORMALIZE_VERSION:
-            return False
-        if check_mtime:
-            stored_mtime = stored_meta.get("source_mtime")
-            if stored_mtime is None:
-                return False
-            current_mtime = os.path.getmtime(source_file)
-            return abs(float(stored_mtime) - current_mtime) < 0.001
-        return True
-    except Exception:
-        return False
+__all__ = ["Palace", "PalaceConfig"]

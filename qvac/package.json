@@ -1,0 +1,21 @@
+{
+  "name": "mempalace-qvac-sidecar",
+  "version": "0.1.0",
+  "description": "Local QVAC sidecar exposing OpenAI-compatible endpoints (embeddings, chat, OCR) plus Hyperdrive model fetch for mempalace.",
+  "type": "module",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "start:dev": "node --watch server.js",
+    "fetch-model": "node fetch-model.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@qvac/sdk": "^0.8.2",
+    "fastify": "^5.0.0"
+  },
+  "license": "Apache-2.0"
+}
